@@ -1,0 +1,4 @@
+python-telegram-bot>=21,<23
+coqui-tts>=0.26
+transformers<5
+numpy<2.1

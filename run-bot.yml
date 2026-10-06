@@ -1,0 +1,45 @@
+name: Run voice bot
+
+on:
+  workflow_dispatch:        # ручной запуск: вкладка Actions -> Run workflow
+  schedule:
+    - cron: "0 */6 * * *"   # перезапуск каждые 6 часов (лимит задачи GitHub - 6 ч)
+
+concurrency:
+  group: voice-bot
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 345
+    env:
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      ALLOWED_USER_IDS: ${{ vars.ALLOWED_USER_IDS }}
+      # Принятие лицензии модели XTTS-v2 (CPML, некоммерческое использование):
+      # https://coqui.ai/cpml
+      COQUI_TOS_AGREED: "1"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install ffmpeg
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg
+
+      - name: Install dependencies (CPU torch)
+        run: |
+          pip install "torch<2.9" "torchaudio<2.9" --index-url https://download.pytorch.org/whl/cpu
+          pip install -r requirements.txt
+
+      - name: Cache XTTS model
+        uses: actions/cache@v4
+        with:
+          path: ~/.local/share/tts
+          key: xtts-v2-model
+
+      - name: Run bot
+        run: python bot.py
