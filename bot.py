@@ -26,9 +26,6 @@ log = logging.getLogger("voice-bot")
 TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 ALLOWED = {int(x) for x in os.getenv("ALLOWED_USER_IDS", "").split(",") if x.strip()}
 MAX_CHARS = 500
-COOLDOWN_SEC = 30        # пауза между генерациями одного пользователя
-DAILY_LIMIT = 15         # генераций в сутки на пользователя
-MAX_QUEUE = 4            # сколько запросов максимум ждёт очереди
 LANGS = {"en", "es", "fr", "de", "it", "pt", "pl", "tr", "ru", "nl", "cs",
          "ar", "zh-cn", "ja", "hu", "ko", "hi"}
 REFS = Path("refs")
@@ -37,8 +34,6 @@ REFS.mkdir(exist_ok=True)
 tts = None                      # модель, грузится при старте
 tts_lock = asyncio.Lock()       # CPU слабый - одна генерация за раз
 waiting = 0                     # сколько запросов сейчас в очереди/в работе
-last_used: dict[int, float] = {}
-daily: dict[tuple[int, str], int] = defaultdict(int)
 
 
 def ffmpeg(*args: str) -> None:
@@ -126,7 +121,6 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if await need_agree(update, ctx):
         return
     text = msg.text.strip()
-    uid = update.effective_user.id
     ref = REFS / f"{update.effective_user.id}.wav"
     if not ref.exists():
         await msg.reply_text("Сначала пришли голосовое сообщение с образцом голоса.")
@@ -134,20 +128,6 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if len(text) > MAX_CHARS:
         await msg.reply_text(f"Слишком длинно: максимум {MAX_CHARS} символов.")
         return
-    now = time.time()
-    wait = COOLDOWN_SEC - (now - last_used.get(uid, 0))
-    if wait > 0:
-        await msg.reply_text(f"Подожди ещё {int(wait) + 1} сек.")
-        return
-    day_key = (uid, time.strftime("%Y-%m-%d"))
-    if daily[day_key] >= DAILY_LIMIT:
-        await msg.reply_text(f"Дневной лимит ({DAILY_LIMIT} генераций) исчерпан, приходи завтра.")
-        return
-    if waiting >= MAX_QUEUE:
-        await msg.reply_text("Сейчас много запросов, попробуй через минуту.")
-        return
-    last_used[uid] = now
-    daily[day_key] += 1
     lang = ctx.user_data.get("lang", "ru")
     waiting += 1
     await msg.reply_text(f"Генерирую (в очереди: {waiting}), на CPU это может занять до минуты...")
