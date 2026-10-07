@@ -31,7 +31,6 @@ from telegram.ext import (Application, CommandHandler, ContextTypes,
 
 logging.basicConfig(format="%(asctime)s %(levelname)s %(name)s: %(message)s",
                     level=logging.INFO)
-# Не пишем в публичный лог тексты пользователей и спам getUpdates
 logging.getLogger("httpx").setLevel(logging.WARNING)
 log = logging.getLogger("voice-bot")
 
@@ -39,17 +38,17 @@ TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 ALLOWED = {int(x) for x in os.getenv("ALLOWED_USER_IDS", "").split(",") if x.strip()}
 QWEN_MODEL = os.getenv("QWEN_MODEL", "Qwen/Qwen3-TTS-12Hz-1.7B-Base")
 WHISPER_MODEL = os.getenv("WHISPER_MODEL", "medium")
-MIN_PROFILE_SEC = 60     # минимум записи для своего голоса
-SR = 24000               # частота, с которой работает Qwen3-TTS
-QUICK_SEC = 15           # длина быстрого образца (лишнее обрезается)
-ANCHOR_SEC = 14          # максимум для ICL-фрагмента: длиннее - слишком медленно на CPU
+MIN_PROFILE_SEC = 60
+SR = 24000
+QUICK_SEC = 15
+ANCHOR_SEC = 14
 
 LANGS = {"ru": "Russian", "en": "English", "zh-cn": "Chinese", "ja": "Japanese",
          "ko": "Korean", "de": "German", "fr": "French", "pt": "Portuguese",
          "es": "Spanish", "it": "Italian"}
 
-VOICES = Path("voices")      # личные голосовые профили
-PENDING = Path("pending")    # записи, которые ещё собираются в профиль
+VOICES = Path("voices")
+PENDING = Path("pending")
 for d in (VOICES, PENDING):
     d.mkdir(exist_ok=True)
 
@@ -59,11 +58,11 @@ B_DELETE = "🗑 Удалить мой голос"
 B_HELP = "ℹ️ Помощь"
 B_CANCEL = "❌ Отмена"
 
-tts = None                      # Qwen3TTSModel
-whisper = None                  # faster-whisper
-tts_lock = asyncio.Lock()       # CPU один - тяжёлые операции идут по очереди
+tts = None
+whisper = None
+tts_lock = asyncio.Lock()
 waiting = 0
-QUICK: dict[int, object] = {}   # быстрые образцы (только в памяти)
+QUICK: dict[int, object] = {}
 PROFILES: dict[int, object] = {}
 
 
@@ -97,7 +96,6 @@ async def need_agree(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> bool:
 
 
 def split_text(text: str, limit: int = 220) -> list[str]:
-    """Режем длинный текст по предложениям: так Qwen озвучивает его стабильнее."""
     parts = re.split(r"(?<=[.!?…])\s+|\n+", text.strip())
     out, cur = [], ""
     for p in (x.strip() for x in parts):
@@ -118,12 +116,11 @@ def split_text(text: str, limit: int = 220) -> list[str]:
             final.append(c[:cut])
             c = c[cut:].strip()
         final.append(c)
-    return final
+    return [x for x in final if x.strip()]
 
 
 def split_chunks(audio: np.ndarray, sr: int, max_sec: float = ANCHOR_SEC,
                  min_sec: float = 3.0) -> list[np.ndarray]:
-    """Режем запись на фрагменты по паузам, каждый не длиннее max_sec."""
     iv = librosa.effects.split(audio, top_db=35)
     spans, cs, ce = [], None, None
     for s, e in iv:
@@ -155,7 +152,6 @@ def transcribe(audio: np.ndarray, sr: int) -> str:
 
 
 def make_item(chunks: list[np.ndarray], sr: int = SR):
-    """Голосовой профиль (ICL): якорь + расшифровка + средний эмбеддинг всех фрагментов."""
     from qwen_tts.inference.qwen3_tts_model import VoiceClonePromptItem
     if not chunks:
         raise ValueError("no speech")
@@ -167,11 +163,11 @@ def make_item(chunks: list[np.ndarray], sr: int = SR):
         embs.append(it.ref_spk_embedding.float())
     mean_emb = torch.stack(embs).mean(0)
 
-    target = 10 * sr   # якорь ближе всего к 10 сек
+    target = 10 * sr
     anchor = min(chunks, key=lambda c: abs(len(c) - target))
     text = transcribe(anchor, sr)
     dev, dt = tts.model.device, tts.model.dtype
-    if not text:   # речь не распознана -> режим только по эмбеддингу
+    if not text:
         return VoiceClonePromptItem(ref_code=None, ref_spk_embedding=mean_emb.to(dev, dt),
                                     x_vector_only_mode=True, icl_mode=False, ref_text=None)
     base = tts.create_voice_clone_prompt(ref_audio=(anchor.astype(np.float32), sr),
@@ -241,6 +237,8 @@ def synthesize(text: str, item, lang: str, out_wav: Path) -> None:
                                             voice_clone_prompt=[item])
         pieces.append(np.asarray(wavs[0], dtype=np.float32))
         pieces.append(np.zeros(int(0.25 * sr), dtype=np.float32))
+    if not pieces:
+        raise ValueError("empty text")
     sf.write(str(out_wav), np.concatenate(pieces[:-1]), sr)
 
 
@@ -372,7 +370,12 @@ async def continue_create(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     d = PENDING / str(uid)
     pieces = sorted(d.glob("*.wav"))
-    total = sum(sf.info(str(p)).duration for p in pieces)
+    total = 0.0
+    for p in pieces:
+        try:
+            total += sf.info(str(p)).duration
+        except Exception:
+            log.warning("bad pending file %s", p)
     if total < MIN_PROFILE_SEC:
         await msg.reply_text(
             f"Записано {int(total)} сек из {MIN_PROFILE_SEC}. "
@@ -409,17 +412,24 @@ async def on_profile_file(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not allowed(update) or await need_agree(update, ctx):
         return
     msg = update.message
-    if msg.document.file_size and msg.document.file_size > 1_000_000:
+    doc = msg.document
+    if doc is None:
+        return
+    name = (doc.file_name or "").lower()
+    if not name.endswith(".qvoice"):
+        return
+    if doc.file_size and doc.file_size > 1_000_000:
         await msg.reply_text("Это не похоже на файл голоса.")
         return
     uid = update.effective_user.id
     with tempfile.TemporaryDirectory() as tmp:
         src = Path(tmp) / "p.safetensors"
-        f = await ctx.bot.get_file(msg.document.file_id)
+        f = await ctx.bot.get_file(doc.file_id)
         await f.download_to_drive(src)
         try:
             load_item(src)
         except Exception:
+            log.exception("bad qvoice file")
             await msg.reply_text("Файл голоса повреждён или не подходит.")
             return
         shutil.copy(src, profile_path(uid))
@@ -434,7 +444,7 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not allowed(update):
         return
     msg = update.message
-    t = msg.text.strip()
+    t = (msg.text or "").strip()
     if t == B_HELP:
         return await start(update, ctx)
     if await need_agree(update, ctx):
@@ -504,7 +514,8 @@ def main():
     app.add_handler(CommandHandler("agree", agree))
     app.add_handler(CommandHandler("lang", set_lang))
     app.add_handler(CommandHandler("cancel", cancel_create))
-    app.add_handler(MessageHandler(filters.Document.FileExtension("qvoice"), on_profile_file))
+    # ВАЖНО: .qvoice должен обрабатываться ДО общего on_audio
+    app.add_handler(MessageHandler(filters.Document.ALL, on_profile_file))
     app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO | filters.Document.AUDIO, on_audio))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
     app.run_polling(drop_pending_updates=False)
