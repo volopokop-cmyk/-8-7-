@@ -1,23 +1,29 @@
-"""Telegram-бот клонирования голоса на базе Coqui XTTS-v2.
+"""Telegram-бот клонирования голоса на базе Qwen3-TTS (Base, Apache 2.0).
 
 Два режима:
-  * Быстрый образец: пришли голосовое/аудио (до 30 сек) -> пришли текст -> озвучка.
+  * Быстрый образец: пришли голосовое/аудио (5-15 сек) -> пришли текст -> озвучка.
   * Свой голос: кнопка «Создать свой голос», записи суммарно от 60 сек ->
     личный голосовой профиль, который использует только его владелец.
+
+Качество: режим ICL (референс + его расшифровка Whisper). Для профиля эмбеддинг
+голоса усредняется по всей длинной записи, а ICL-якорем служит чистый фрагмент.
 """
 import asyncio
 import logging
 import os
+import re
 import shutil
 import subprocess
 import tempfile
 import time
 from pathlib import Path
 
+import librosa
 import numpy as np
 import soundfile as sf
 import torch
-from safetensors.torch import load_file, save_file
+from safetensors import safe_open
+from safetensors.torch import save_file
 from telegram import ReplyKeyboardMarkup, Update
 from telegram.constants import ChatAction
 from telegram.ext import (Application, CommandHandler, ContextTypes,
@@ -26,20 +32,25 @@ from telegram.ext import (Application, CommandHandler, ContextTypes,
 logging.basicConfig(format="%(asctime)s %(levelname)s %(name)s: %(message)s",
                     level=logging.INFO)
 # Не пишем в публичный лог тексты пользователей и спам getUpdates
-logging.getLogger("TTS").setLevel(logging.WARNING)
 logging.getLogger("httpx").setLevel(logging.WARNING)
 log = logging.getLogger("voice-bot")
 
 TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 ALLOWED = {int(x) for x in os.getenv("ALLOWED_USER_IDS", "").split(",") if x.strip()}
+QWEN_MODEL = os.getenv("QWEN_MODEL", "Qwen/Qwen3-TTS-12Hz-1.7B-Base")
+WHISPER_MODEL = os.getenv("WHISPER_MODEL", "medium")
 MIN_PROFILE_SEC = 60     # минимум записи для своего голоса
-LANGS = {"en", "es", "fr", "de", "it", "pt", "pl", "tr", "ru", "nl", "cs",
-         "ar", "zh-cn", "ja", "hu", "ko", "hi"}
+SR = 24000               # частота, с которой работает Qwen3-TTS
+QUICK_SEC = 15           # длина быстрого образца (лишнее обрезается)
+ANCHOR_SEC = 14          # максимум для ICL-фрагмента: длиннее - слишком медленно на CPU
 
-REFS = Path("refs")          # быстрые образцы
+LANGS = {"ru": "Russian", "en": "English", "zh-cn": "Chinese", "ja": "Japanese",
+         "ko": "Korean", "de": "German", "fr": "French", "pt": "Portuguese",
+         "es": "Spanish", "it": "Italian"}
+
 VOICES = Path("voices")      # личные голосовые профили
 PENDING = Path("pending")    # записи, которые ещё собираются в профиль
-for d in (REFS, VOICES, PENDING):
+for d in (VOICES, PENDING):
     d.mkdir(exist_ok=True)
 
 B_CREATE = "🎙 Создать свой голос"
@@ -48,9 +59,12 @@ B_DELETE = "🗑 Удалить мой голос"
 B_HELP = "ℹ️ Помощь"
 B_CANCEL = "❌ Отмена"
 
-tts = None                      # модель, грузится при старте
-tts_lock = asyncio.Lock()       # CPU один - генерации идут по очереди
-waiting = 0                     # сколько запросов сейчас в очереди/в работе
+tts = None                      # Qwen3TTSModel
+whisper = None                  # faster-whisper
+tts_lock = asyncio.Lock()       # CPU один - тяжёлые операции идут по очереди
+waiting = 0
+QUICK: dict[int, object] = {}   # быстрые образцы (только в памяти)
+PROFILES: dict[int, object] = {}
 
 
 # ---------- утилиты ----------
@@ -82,42 +96,152 @@ async def need_agree(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> bool:
     return True
 
 
-# ---------- работа с моделью (блокирующие функции) ----------
-def synth_quick(text: str, ref: Path, lang: str, out_wav: Path) -> None:
-    tts.tts_to_file(text=text, speaker_wav=str(ref), language=lang,
-                    file_path=str(out_wav), split_sentences=True)
+def split_text(text: str, limit: int = 220) -> list[str]:
+    """Режем длинный текст по предложениям: так Qwen озвучивает его стабильнее."""
+    parts = re.split(r"(?<=[.!?…])\s+|\n+", text.strip())
+    out, cur = [], ""
+    for p in (x.strip() for x in parts):
+        if not p:
+            continue
+        if cur and len(cur) + 1 + len(p) > limit:
+            out.append(cur)
+            cur = p
+        else:
+            cur = f"{cur} {p}".strip()
+    if cur:
+        out.append(cur)
+    final = []
+    for c in out:
+        while len(c) > limit * 1.5:
+            cut = c.rfind(" ", 0, limit)
+            cut = cut if cut > 0 else limit
+            final.append(c[:cut])
+            c = c[cut:].strip()
+        final.append(c)
+    return final
 
 
-def build_profile(wav_paths: list[Path], uid: int, tmp: Path) -> None:
-    """Строит личный голосовой профиль (слепок голоса) по длинной записи."""
-    model = tts.synthesizer.tts_model
+def split_chunks(audio: np.ndarray, sr: int, max_sec: float = ANCHOR_SEC,
+                 min_sec: float = 3.0) -> list[np.ndarray]:
+    """Режем запись на фрагменты по паузам, каждый не длиннее max_sec."""
+    iv = librosa.effects.split(audio, top_db=35)
+    spans, cs, ce = [], None, None
+    for s, e in iv:
+        if cs is None:
+            cs, ce = s, e
+        elif (e - cs) / sr <= max_sec:
+            ce = e
+        else:
+            spans.append((cs, ce))
+            cs, ce = s, e
+    if cs is not None:
+        spans.append((cs, ce))
+    out = []
+    step = int(max_sec * sr)
+    for s, e in spans:
+        while (e - s) > step * 1.5:
+            out.append(audio[s:s + step])
+            s += step
+        if (e - s) / sr >= min_sec:
+            out.append(audio[s:e])
+    return out
+
+
+# ---------- работа с моделями (блокирующие функции) ----------
+def transcribe(audio: np.ndarray, sr: int) -> str:
+    a16 = librosa.resample(audio.astype(np.float32), orig_sr=sr, target_sr=16000)
+    segments, _ = whisper.transcribe(a16, beam_size=5, vad_filter=False)
+    return " ".join(s.text.strip() for s in segments).strip()
+
+
+def make_item(chunks: list[np.ndarray], sr: int = SR):
+    """Голосовой профиль (ICL): якорь + расшифровка + средний эмбеддинг всех фрагментов."""
+    from qwen_tts.inference.qwen3_tts_model import VoiceClonePromptItem
+    if not chunks:
+        raise ValueError("no speech")
+    step = max(1, len(chunks) // 10)
+    embs = []
+    for c in chunks[::step][:10]:
+        it = tts.create_voice_clone_prompt(ref_audio=(c.astype(np.float32), sr),
+                                           x_vector_only_mode=True)[0]
+        embs.append(it.ref_spk_embedding.float())
+    mean_emb = torch.stack(embs).mean(0)
+
+    target = 10 * sr   # якорь ближе всего к 10 сек
+    anchor = min(chunks, key=lambda c: abs(len(c) - target))
+    text = transcribe(anchor, sr)
+    dev, dt = tts.model.device, tts.model.dtype
+    if not text:   # речь не распознана -> режим только по эмбеддингу
+        return VoiceClonePromptItem(ref_code=None, ref_spk_embedding=mean_emb.to(dev, dt),
+                                    x_vector_only_mode=True, icl_mode=False, ref_text=None)
+    base = tts.create_voice_clone_prompt(ref_audio=(anchor.astype(np.float32), sr),
+                                         ref_text=text, x_vector_only_mode=False)[0]
+    return VoiceClonePromptItem(ref_code=base.ref_code, ref_spk_embedding=mean_emb.to(dev, dt),
+                                x_vector_only_mode=False, icl_mode=True, ref_text=text)
+
+
+def save_item(item, path: Path) -> None:
+    tensors = {"spk": item.ref_spk_embedding.detach().float().cpu().clone().contiguous()}
+    meta = {"mode": "xvec"}
+    if item.icl_mode and item.ref_code is not None:
+        tensors["code"] = item.ref_code.detach().cpu().clone().contiguous()
+        meta = {"mode": "icl", "ref_text": item.ref_text or ""}
+    save_file(tensors, str(path), metadata=meta)
+
+
+def load_item(path: Path):
+    from qwen_tts.inference.qwen3_tts_model import VoiceClonePromptItem
+    with safe_open(str(path), framework="pt") as f:
+        meta = f.metadata() or {}
+        keys = set(f.keys())
+        spk = f.get_tensor("spk")
+        code = f.get_tensor("code") if "code" in keys else None
+    if spk.ndim != 1 or spk.numel() > 8192:
+        raise ValueError("bad spk")
+    if code is not None:
+        if code.ndim != 2 or code.shape[0] > 800 or code.shape[1] > 64 \
+                or int(code.min()) < 0 or int(code.max()) >= 8192:
+            raise ValueError("bad code")
+        text = meta.get("ref_text", "")
+        if not text or len(text) > 2000:
+            raise ValueError("bad text")
+    dev, dt = tts.model.device, tts.model.dtype
+    spk = spk.to(dev, dt)
+    if code is None:
+        return VoiceClonePromptItem(ref_code=None, ref_spk_embedding=spk,
+                                    x_vector_only_mode=True, icl_mode=False, ref_text=None)
+    return VoiceClonePromptItem(ref_code=code.long().to(dev), ref_spk_embedding=spk,
+                                x_vector_only_mode=False, icl_mode=True, ref_text=text)
+
+
+def get_profile(uid: int):
+    if uid not in PROFILES:
+        PROFILES[uid] = load_item(profile_path(uid))
+    return PROFILES[uid]
+
+
+def build_profile(wav_paths: list[Path], uid: int) -> None:
     audio = np.concatenate([sf.read(str(p), dtype="float32")[0] for p in wav_paths])
-    combo = tmp / "all.wav"
-    sf.write(str(combo), audio, 22050)
-    gpt, spk = model.get_conditioning_latents(
-        audio_path=[str(combo)], gpt_cond_len=30, gpt_cond_chunk_len=4,
-        max_ref_length=60)
-    save_file({"gpt": gpt.detach().cpu().clone().contiguous(),
-               "spk": spk.detach().cpu().clone().contiguous()},
-              str(profile_path(uid)))
+    item = make_item(split_chunks(audio, SR))
+    save_item(item, profile_path(uid))
+    PROFILES[uid] = item
 
 
-def load_profile(path: Path) -> dict:
-    d = load_file(str(path))
-    gpt, spk = d["gpt"], d["spk"]
-    if gpt.ndim != 3 or spk.ndim != 3 or gpt.shape[0] != 1 or spk.shape[0] != 1 \
-            or gpt.numel() > 200_000 or spk.numel() > 4096:
-        raise ValueError("bad profile")
-    return {"gpt": gpt.float(), "spk": spk.float()}
+def make_quick(wav: Path, uid: int) -> None:
+    audio, _ = sf.read(str(wav), dtype="float32")
+    audio, _ = librosa.effects.trim(audio, top_db=35)
+    QUICK[uid] = make_item([audio])
 
 
-def synth_profile(text: str, uid: int, lang: str, out_wav: Path) -> None:
-    model = tts.synthesizer.tts_model
-    dev = next(model.parameters()).device
-    prof = load_profile(profile_path(uid))
-    out = model.inference(text, lang, prof["gpt"].to(dev), prof["spk"].to(dev),
-                          enable_text_splitting=True)
-    sf.write(str(out_wav), np.asarray(out["wav"], dtype=np.float32), 24000)
+def synthesize(text: str, item, lang: str, out_wav: Path) -> None:
+    pieces = []
+    sr = SR
+    for chunk in split_text(text):
+        wavs, sr = tts.generate_voice_clone(text=chunk, language=lang,
+                                            voice_clone_prompt=[item])
+        pieces.append(np.asarray(wavs[0], dtype=np.float32))
+        pieces.append(np.zeros(int(0.25 * sr), dtype=np.float32))
+    sf.write(str(out_wav), np.concatenate(pieces[:-1]), sr)
 
 
 # ---------- команды и кнопки ----------
@@ -125,11 +249,13 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not allowed(update):
         return
     await update.message.reply_text(
-        "Привет! Я клонирую голос.\n\n"
-        "⚡ Быстрый способ: пришли голосовое или аудио (5-30 сек) - потом текст, и я озвучу его этим голосом.\n"
+        "Привет! Я клонирую голос (Qwen3-TTS).\n\n"
+        "⚡ Быстрый способ: пришли голосовое или аудио (5-15 сек, чистая речь) - потом текст, "
+        "и я озвучу его этим голосом.\n"
         "🎙 Свой голос: нажми «Создать свой голос», запиши минимум 1 минуту речи - "
-        "я сделаю личный голосовой профиль, доступный только тебе.\n"
-        "/lang ru - язык озвучки (ru, en, de, fr, es, it, pt, pl, tr, nl, cs, ar, zh-cn, ja, hu, ko, hi)\n\n"
+        "я сделаю личный голосовой профиль, доступный только тебе. Так качество выше.\n"
+        "/lang ru - язык озвучки (ru, en, zh-cn, ja, ko, de, fr, pt, es, it)\n\n"
+        "Озвучка идёт на процессоре и занимает от десятков секунд до нескольких минут.\n\n"
         "Используй только голоса, на клонирование которых есть согласие их владельцев. "
         "Запрещено выдавать сгенерированную речь за реального человека, "
         "обманывать и мошенничать.\n\n"
@@ -151,7 +277,7 @@ async def set_lang(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     lang = (ctx.args[0].lower() if ctx.args else "")
     if lang not in LANGS:
-        await update.message.reply_text("Пример: /lang ru\nДоступно: " + ", ".join(sorted(LANGS)))
+        await update.message.reply_text("Пример: /lang ru\nДоступно: " + ", ".join(LANGS))
         return
     ctx.user_data["lang"] = lang
     await update.message.reply_text(f"Язык озвучки: {lang}")
@@ -185,7 +311,8 @@ async def use_mine(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def delete_mine(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     profile_path(uid).unlink(missing_ok=True)
-    (REFS / f"{uid}.wav").unlink(missing_ok=True)
+    PROFILES.pop(uid, None)
+    QUICK.pop(uid, None)
     shutil.rmtree(PENDING / str(uid), ignore_errors=True)
     ctx.user_data.pop("mode", None)
     ctx.user_data["creating"] = False
@@ -214,21 +341,29 @@ async def on_audio(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             d = PENDING / str(uid)
             d.mkdir(parents=True, exist_ok=True)
             dst = d / f"{time.time_ns()}.wav"
-            args = ("-i", str(src), "-t", "300", "-ar", "22050", "-ac", "1", str(dst))
+            args = ("-i", str(src), "-t", "300", "-ar", str(SR), "-ac", "1", str(dst))
         else:
-            dst = REFS / f"{uid}.wav"
-            args = ("-i", str(src), "-t", "30", "-ar", "22050", "-ac", "1", str(dst))
+            dst = Path(tmp) / "quick.wav"
+            args = ("-i", str(src), "-t", str(QUICK_SEC), "-ar", str(SR), "-ac", "1", str(dst))
         try:
             await asyncio.to_thread(ffmpeg, *args)
         except subprocess.CalledProcessError:
             await msg.reply_text("Не получилось прочитать аудио, попробуй другой файл.")
             return
-    if not creating:
-        ctx.user_data["mode"] = "quick"
-        await msg.reply_text(
-            "Быстрый образец сохранён. Пришли текст.\n"
-            "(Чтобы вернуться к своему голосу, нажми «🧬 Мой голос».)")
-        return
+        if not creating:
+            await msg.reply_text("Анализирую образец голоса...")
+            try:
+                async with tts_lock:
+                    await asyncio.to_thread(make_quick, dst, uid)
+            except Exception:
+                log.exception("quick sample failed")
+                await msg.reply_text("Не удалось обработать образец: нужна чистая речь, хотя бы 3 секунды.")
+                return
+            ctx.user_data["mode"] = "quick"
+            await msg.reply_text(
+                "Образец принят. Пришли текст.\n"
+                "(Чтобы вернуться к своему голосу, нажми «🧬 Мой голос».)")
+            return
     await continue_create(update, ctx)
 
 
@@ -247,10 +382,9 @@ async def continue_create(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     ctx.user_data["building"] = True
     try:
-        await msg.reply_text("Записей достаточно. Создаю твой голос, это займёт до минуты...")
+        await msg.reply_text("Записей достаточно. Создаю твой голос, это займёт несколько минут...")
         async with tts_lock:
-            with tempfile.TemporaryDirectory() as tmp:
-                await asyncio.to_thread(build_profile, pieces, uid, Path(tmp))
+            await asyncio.to_thread(build_profile, pieces, uid)
         shutil.rmtree(d, ignore_errors=True)
         ctx.user_data["creating"] = False
         ctx.user_data["mode"] = "profile"
@@ -259,19 +393,19 @@ async def continue_create(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             reply_markup=keyboard())
         with profile_path(uid).open("rb") as fh:
             await msg.reply_document(
-                fh, filename="my_voice.xtts",
+                fh, filename="my_voice.qvoice",
                 caption="Резервная копия твоего голоса. Храни её в тайне: по ней можно "
                         "озвучивать твоим голосом. Бот может перезапуститься и забыть профиль - "
                         "просто пришли этот файл мне, и голос восстановится.")
     except Exception:
         log.exception("profile build failed")
-        await msg.reply_text("Ошибка при создании голоса, попробуй ещё раз.")
+        await msg.reply_text("Не удалось создать голос. Нужна чистая речь без музыки, попробуй ещё раз.")
     finally:
         ctx.user_data["building"] = False
 
 
 async def on_profile_file(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Восстановление голоса из резервной копии .xtts."""
+    """Восстановление голоса из резервной копии .qvoice."""
     if not allowed(update) or await need_agree(update, ctx):
         return
     msg = update.message
@@ -284,11 +418,12 @@ async def on_profile_file(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f = await ctx.bot.get_file(msg.document.file_id)
         await f.download_to_drive(src)
         try:
-            load_profile(src)
+            load_item(src)
         except Exception:
             await msg.reply_text("Файл голоса повреждён или не подходит.")
             return
         shutil.copy(src, profile_path(uid))
+    PROFILES.pop(uid, None)
     ctx.user_data["mode"] = "profile"
     await msg.reply_text("Голос восстановлен. Пришли текст.")
 
@@ -320,27 +455,24 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     mode = ctx.user_data.get("mode") or ("profile" if has_profile(uid) else "quick")
     if mode == "profile" and not has_profile(uid):
         mode = "quick"
-    ref = REFS / f"{uid}.wav"
-    if mode == "quick" and not ref.exists():
+    if mode == "quick" and uid not in QUICK:
         await msg.reply_text(
             "Сначала пришли голосовое с образцом голоса или нажми «Создать свой голос».")
         return
 
-    lang = ctx.user_data.get("lang", "ru")
+    lang = LANGS[ctx.user_data.get("lang", "ru")]
     waiting += 1
     try:
-        await msg.reply_text(f"Генерирую (в очереди: {waiting})...")
+        await msg.reply_text(f"Генерирую (в очереди: {waiting}). На процессоре это может занять несколько минут...")
         async with tts_lock:
             await ctx.bot.send_chat_action(msg.chat_id, ChatAction.RECORD_VOICE)
             with tempfile.TemporaryDirectory() as tmp:
                 wav, ogg = Path(tmp) / "out.wav", Path(tmp) / "out.ogg"
                 try:
-                    if mode == "profile":
-                        await asyncio.to_thread(synth_profile, t, uid, lang, wav)
-                    else:
-                        await asyncio.to_thread(synth_quick, t, ref, lang, wav)
+                    item = await asyncio.to_thread(get_profile, uid) if mode == "profile" else QUICK[uid]
+                    await asyncio.to_thread(synthesize, t, item, lang, wav)
                     await asyncio.to_thread(ffmpeg, "-i", str(wav), "-c:a", "libopus",
-                                            "-b:a", "48k", str(ogg))
+                                            "-b:a", "64k", str(ogg))
                 except Exception:
                     log.exception("synthesis failed")
                     await msg.reply_text("Ошибка генерации, попробуй ещё раз.")
@@ -352,19 +484,27 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 def main():
-    global tts
-    from TTS.api import TTS
-    log.info("Loading XTTS-v2...")
-    tts = TTS("tts_models/multilingual/multi-dataset/xtts_v2").to(
-        "cuda" if torch.cuda.is_available() else "cpu")
-    log.info("Model loaded")
+    global tts, whisper
+    from faster_whisper import WhisperModel
+    from qwen_tts import Qwen3TTSModel
+    cuda = torch.cuda.is_available()
+    log.info("Loading %s ...", QWEN_MODEL)
+    tts = Qwen3TTSModel.from_pretrained(
+        QWEN_MODEL,
+        device_map="cuda:0" if cuda else "cpu",
+        dtype=torch.bfloat16 if cuda else torch.float32)
+    log.info("Loading Whisper %s ...", WHISPER_MODEL)
+    whisper = WhisperModel(WHISPER_MODEL, device="cuda" if cuda else "cpu",
+                           compute_type="float16" if cuda else "int8")
+    log.info("Models loaded")
 
-    app = Application.builder().token(TOKEN).build()
+    app = (Application.builder().token(TOKEN).concurrent_updates(True)
+           .read_timeout(60).write_timeout(120).connect_timeout(30).build())
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("agree", agree))
     app.add_handler(CommandHandler("lang", set_lang))
     app.add_handler(CommandHandler("cancel", cancel_create))
-    app.add_handler(MessageHandler(filters.Document.FileExtension("xtts"), on_profile_file))
+    app.add_handler(MessageHandler(filters.Document.FileExtension("qvoice"), on_profile_file))
     app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO | filters.Document.AUDIO, on_audio))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
     app.run_polling(drop_pending_updates=False)
