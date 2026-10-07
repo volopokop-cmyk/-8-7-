@@ -1,4 +1,9 @@
-python-telegram-bot>=21,<23
-coqui-tts>=0.26
-transformers<5
-numpy<2.1
+python-telegram-bot>=21.0
+faster-whisper>=1.0.0
+torch>=2.1
+torchaudio
+librosa
+soundfile
+numpy
+safetensors
+qwen-tts @ git+https://github.com/QwenLM/Qwen3-TTS.git
