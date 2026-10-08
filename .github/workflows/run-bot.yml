@@ -1,14 +1,20 @@
 name: Run voice bot
- 
+
 on:
-  workflow_dispatch:        # ручной запуск: вкладка Actions -> Run workflow
+  workflow_dispatch:
+    inputs:
+      model:
+        description: "Модель (auto = цепочка с автопереключением, если модель падает)"
+        type: choice
+        default: auto
+        options: [auto, qwen-1.7b, qwen-0.6b, xtts]
   schedule:
     - cron: "0 */6 * * *"   # перезапуск каждые 6 часов (лимит задачи GitHub - 6 ч)
- 
+
 concurrency:
   group: voice-bot
   cancel-in-progress: false
- 
+
 jobs:
   run:
     runs-on: ubuntu-latest
@@ -16,30 +22,44 @@ jobs:
     env:
       TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
       ALLOWED_USER_IDS: ${{ vars.ALLOWED_USER_IDS }}
-      # Принятие лицензии модели XTTS-v2 (CPML, некоммерческое использование):
-      # https://coqui.ai/cpml
+      ADMIN_ID: ${{ vars.ADMIN_ID }}              # кто может менять модель командой /model
+      WHISPER_MODEL: ${{ vars.WHISPER_MODEL || 'small' }}
+      # Цепочка моделей: берётся первая, при падении - следующая.
+      # Изменить: Settings -> Variables -> MODEL_CHAIN, например "qwen-1.7b qwen-0.6b xtts"
+      MODEL_CHAIN: ${{ (inputs.model != 'auto' && inputs.model) || vars.MODEL_CHAIN || 'qwen-0.6b xtts' }}
+      # Принятие лицензии XTTS-v2 (CPML, некоммерческое использование): https://coqui.ai/cpml
+      # Нужно только если в цепочке есть xtts. Модели Qwen3-TTS - Apache 2.0.
       COQUI_TOS_AGREED: "1"
     steps:
       - uses: actions/checkout@v4
- 
+
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: "3.12"
           cache: pip
- 
-      - name: Install ffmpeg
-        run: sudo apt-get update && sudo apt-get install -y ffmpeg
- 
+
+      - name: Install system packages
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg sox
+
       - name: Install dependencies (CPU torch)
         run: |
           pip install "torch<2.9" "torchaudio<2.9" --index-url https://download.pytorch.org/whl/cpu
           pip install -r requirements.txt
- 
-      - name: Cache XTTS model
+
+      - name: Cache models
         uses: actions/cache@v4
         with:
-          path: ~/.local/share/tts
-          key: xtts-v2-model
- 
-      - name: Run bot
-        run: python bot.py
+          path: |
+            ~/.cache/huggingface
+            ~/.local/share/tts
+          key: models-${{ github.run_id }}
+          restore-keys: models-
+
+      - name: Run bot (with fallback to the next model if one crashes)
+        run: |
+          for m in $MODEL_CHAIN; do
+            echo "::group::Starting with model $m"
+            BOT_MODEL=$m python bot.py && break
+            echo "::warning::Model $m stopped with an error, trying the next one"
+            echo "::endgroup::"
+          done
