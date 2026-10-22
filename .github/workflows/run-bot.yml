@@ -1,6 +1,8 @@
 name: Run voice bot
+ 
 
 on:
+  workflow_dispatch:        # ручной запуск: вкладка Actions -> Run workflow
   workflow_dispatch:
     inputs:
       model:
@@ -9,11 +11,13 @@ on:
         default: auto
         options: [auto, qwen-1.7b, qwen-0.6b, xtts]
   schedule:
-    - cron: "0 */6 * * *"
+    - cron: "0 */6 * * *"   # перезапуск каждые 6 часов (лимит задачи GitHub - 6 ч)
+ 
 
 concurrency:
   group: voice-bot
   cancel-in-progress: false
+ 
 
 jobs:
   run:
@@ -22,21 +26,29 @@ jobs:
     env:
       TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
       ALLOWED_USER_IDS: ${{ vars.ALLOWED_USER_IDS }}
-      ADMIN_ID: ${{ vars.ADMIN_ID }}
+      # Принятие лицензии модели XTTS-v2 (CPML, некоммерческое использование):
+      # https://coqui.ai/cpml
+      ADMIN_ID: ${{ vars.ADMIN_ID }}              # кто может менять модель командой /model
       WHISPER_MODEL: ${{ vars.WHISPER_MODEL || 'small' }}
+      # Цепочка моделей: берётся первая, при падении - следующая.
+      # Изменить: Settings -> Variables -> MODEL_CHAIN, например "qwen-1.7b qwen-0.6b xtts"
       MODEL_CHAIN: ${{ (inputs.model != 'auto' && inputs.model) || vars.MODEL_CHAIN || 'qwen-0.6b xtts' }}
+      # Принятие лицензии XTTS-v2 (CPML, некоммерческое использование): https://coqui.ai/cpml
+      # Нужно только если в цепочке есть xtts. Модели Qwen3-TTS - Apache 2.0.
       COQUI_TOS_AGREED: "1"
-      IMAGE_SIZE: 384
-      IMAGE_STEPS: 1
-      GIF_KEYS: 2
-      GIF_FRAMES: 6
     steps:
       - uses: actions/checkout@v4
+ 
 
       - uses: actions/setup-python@v5
         with:
+          python-version: "3.11"
           python-version: "3.12"
           cache: pip
+ 
+      - name: Install ffmpeg
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg
+ 
 
       - name: Install system packages
         run: sudo apt-get update && sudo apt-get install -y ffmpeg sox
@@ -45,13 +57,17 @@ jobs:
         run: |
           pip install "torch<2.9" "torchaudio<2.9" --index-url https://download.pytorch.org/whl/cpu
           pip install -r requirements.txt
-
-      - name: Upgrade Pillow
-        run: pip install --upgrade Pillow
+ 
+      - name: Cache XTTS model
 
       - name: Cache models
         uses: actions/cache@v4
         with:
+          path: ~/.local/share/tts
+          key: xtts-v2-model
+ 
+      - name: Run bot
+        run: python bot.py
           path: |
             ~/.cache/huggingface
             ~/.local/share/tts
