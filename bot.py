@@ -1,15 +1,27 @@
-"""Telegram-бот клонирования голоса. Модели на выбор (BOT_MODEL или /model):
+"""Telegram-бот клонирования голоса + генерация картинок и 5-секундных GIF.
+
+TTS-модели на выбор (BOT_MODEL или /model):
   qwen-1.7b  - Qwen3-TTS 1.7B, лучшее качество, тяжёлая (~8 ГБ RAM, медленная)
   qwen-0.6b  - Qwen3-TTS 0.6B, хорошее качество, втрое легче
   xtts       - Coqui XTTS-v2, самая лёгкая и быстрая
 
-Два режима:
-  * Быстрый образец: пришли голосовое/аудио (5-15 сек) -> пришли текст -> озвучка.
-  * Свой голос: кнопка «Создать свой голос», записи суммарно от 60 сек ->
-    личный голосовой профиль, который использует только его владелец.
+Картинки/GIF: stabilityai/sd-turbo (лёгкий, CPU/CUDA, ~2.5 ГБ).
+  /image <промпт>   — одна картинка
+  /gif   <промпт>   — GIF 5 сек из нескольких кадров
+                      Ключевые кадры через «|»:
+                      /gif кот сидит|кот прыгает|кот приземлился
+                      Без «|» — 4 разных сида, кроссфейд до GIF_FRAMES.
 
-Качество: режим ICL (референс + его расшифровка Whisper). Для профиля эмбеддинг
-голоса усредняется по всей длинной записи, а ICL-якорем служит чистый фрагмент.
+Два голосовых режима:
+  * Быстрый образец: голосовое/аудио (5-15 сек) -> текст -> озвучка.
+  * Свой голос: кнопка «Создать свой голос», записи от 60 сек ->
+    личный профиль, использует только владелец.
+
+Качество: ICL (референс + расшифровка Whisper). Для профиля эмбеддинг
+усредняется по длинной записи, ICL-якорем служит чистый фрагмент.
+
+Зависимости: pip install python-telegram-bot faster-whisper qwen-tts TTS \
+            librosa soundfile safetensors diffusers Pillow
 """
 import asyncio
 import gc
@@ -26,6 +38,7 @@ import librosa
 import numpy as np
 import soundfile as sf
 import torch
+from PIL import Image
 from safetensors import safe_open
 from safetensors.torch import save_file
 from telegram import ReplyKeyboardMarkup, Update
@@ -35,27 +48,35 @@ from telegram.ext import (Application, CommandHandler, ContextTypes,
 
 logging.basicConfig(format="%(asctime)s %(levelname)s %(name)s: %(message)s",
                     level=logging.INFO)
-# Не пишем в публичный лог тексты пользователей и спам getUpdates
 logging.getLogger("httpx").setLevel(logging.WARNING)
 log = logging.getLogger("voice-bot")
 
 TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 ALLOWED = {int(x) for x in os.getenv("ALLOWED_USER_IDS", "").split(",") if x.strip()}
 BOT_MODEL = os.getenv("BOT_MODEL", "qwen-0.6b")
-ADMIN_ID = int(os.getenv("ADMIN_ID") or 0)           # кто может менять модель командой /model
-WHISPER_MODEL = os.getenv("WHISPER_MODEL", "small")  # для Qwen (расшифровка образца); medium точнее, но тяжелее
-MIN_PROFILE_SEC = 60     # минимум записи для своего голоса
-SR = 24000               # частота, с которой работает Qwen3-TTS
-QUICK_SEC = 15           # длина быстрого образца (лишнее обрезается)
-ANCHOR_SEC = 14          # максимум для ICL-фрагмента: длиннее - слишком медленно на CPU
+ADMIN_ID = int(os.getenv("ADMIN_ID") or 0)
+WHISPER_MODEL = os.getenv("WHISPER_MODEL", "small")
+MIN_PROFILE_SEC = 60
+SR = 24000
+QUICK_SEC = 15
+ANCHOR_SEC = 14
+
+# ---- картинки ----
+IMAGE_MODEL_ID = os.getenv("IMAGE_MODEL", "stabilityai/sd-turbo")
+IMAGE_SIZE = int(os.getenv("IMAGE_SIZE", "512"))       # должно быть кратно 8
+IMAGE_STEPS = int(os.getenv("IMAGE_STEPS", "2"))       # sd-turbo: 1-4
+GIF_FRAMES = int(os.getenv("GIF_FRAMES", "10"))        # кадров в GIF
+GIF_SECONDS = 5                                        # длительность GIF
+GIF_KEYS = 4                                           # ключевых кадров при одном промпте
+PROMPT_MAX = 1000
 
 QWEN_LANGS = {"ru": "Russian", "en": "English", "zh-cn": "Chinese", "ja": "Japanese",
               "ko": "Korean", "de": "German", "fr": "French", "pt": "Portuguese",
               "es": "Spanish", "it": "Italian"}
-LANGS = list(QWEN_LANGS)     # общий набор языков, который понимают все модели
+LANGS = list(QWEN_LANGS)
 
-VOICES = Path("voices")      # личные голосовые профили
-PENDING = Path("pending")    # записи, которые ещё собираются в профиль
+VOICES = Path("voices")
+PENDING = Path("pending")
 for d in (VOICES, PENDING):
     d.mkdir(exist_ok=True)
 
@@ -64,17 +85,23 @@ B_MINE = "🧬 Мой голос"
 B_DELETE = "🗑 Удалить мой голос"
 B_HELP = "ℹ️ Помощь"
 B_CANCEL = "❌ Отмена"
+B_IMAGE = "🖼 Картинка"
+B_GIF = "🎞 Гифка"
 
-B = None                        # текущая модель (Backend)
-tts_lock = asyncio.Lock()       # CPU один - тяжёлые операции идут по очереди
+B = None                        # текущая TTS-модель
+IMG = None                      # картинная модель (ленивая)
+tts_lock = asyncio.Lock()       # один тяжёлый расчёт за раз
 waiting = 0
-QUICK: dict[int, object] = {}   # быстрые образцы (только в памяти, привязаны к модели)
+QUICK: dict[int, object] = {}
 PROFILES: dict[int, object] = {}
 
 
 # ---------- утилиты ----------
 def keyboard(creating: bool = False) -> ReplyKeyboardMarkup:
-    rows = [[B_CANCEL]] if creating else [[B_CREATE, B_MINE], [B_DELETE, B_HELP]]
+    if creating:
+        rows = [[B_CANCEL]]
+    else:
+        rows = [[B_CREATE, B_MINE], [B_IMAGE, B_GIF], [B_DELETE, B_HELP]]
     return ReplyKeyboardMarkup(rows, resize_keyboard=True)
 
 
@@ -83,7 +110,6 @@ def ffmpeg(*args: str) -> None:
 
 
 def profile_path(uid: int) -> Path:
-    # профиль зависит от модели: у каждой свой формат эмбеддингов
     return VOICES / f"{uid}.{B.name}.safetensors"
 
 
@@ -103,7 +129,6 @@ async def need_agree(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> bool:
 
 
 def split_text(text: str, limit: int = 220) -> list[str]:
-    """Режем длинный текст по предложениям: так Qwen озвучивает его стабильнее."""
     parts = re.split(r"(?<=[.!?…])\s+|\n+", text.strip())
     out, cur = [], ""
     for p in (x.strip() for x in parts):
@@ -129,7 +154,6 @@ def split_text(text: str, limit: int = 220) -> list[str]:
 
 def split_chunks(audio: np.ndarray, sr: int, max_sec: float = ANCHOR_SEC,
                  min_sec: float = 3.0) -> list[np.ndarray]:
-    """Режем запись на фрагменты по паузам, каждый не длиннее max_sec."""
     iv = librosa.effects.split(audio, top_db=35)
     spans, cs, ce = [], None, None
     for s, e in iv:
@@ -153,9 +177,9 @@ def split_chunks(audio: np.ndarray, sr: int, max_sec: float = ANCHOR_SEC,
     return out
 
 
-# ---------- модели ----------
+# ---------- TTS-модели ----------
 class WrongModel(Exception):
-    """Профиль создан для другой модели."""
+    pass
 
 
 def _save(tensors: dict, path: Path, meta: dict) -> None:
@@ -208,7 +232,6 @@ class QwenBackend:
         return " ".join(x.text.strip() for x in segments).strip()
 
     def make_item(self, chunks: list[np.ndarray]):
-        """ICL: якорь + расшифровка + средний эмбеддинг всех фрагментов."""
         from qwen_tts.inference.qwen3_tts_model import VoiceClonePromptItem
         if not chunks:
             raise ValueError("no speech")
@@ -222,7 +245,7 @@ class QwenBackend:
         anchor = min(chunks, key=lambda c: abs(len(c) - 10 * SR))
         text = self._transcribe(anchor, SR)
         dev, dt = self.tts.model.device, self.tts.model.dtype
-        if not text:   # речь не распознана -> только по эмбеддингу
+        if not text:
             return VoiceClonePromptItem(ref_code=None, ref_spk_embedding=mean_emb.to(dev, dt),
                                         x_vector_only_mode=True, icl_mode=False, ref_text=None)
         base = self.tts.create_voice_clone_prompt(
@@ -319,10 +342,13 @@ MODELS = {
 
 
 def swap_model(name: str) -> None:
-    """Меняет модель на лету. Если новая не загрузилась - возвращает прежнюю."""
-    global B
+    """Меняет TTS-модель. Картинную тоже выгружаем, чтобы не было OOM."""
+    global B, IMG
     old = B
     old.unload()
+    if IMG is not None:
+        IMG.unload()
+        IMG = None
     QUICK.clear()
     PROFILES.clear()
     try:
@@ -364,23 +390,120 @@ def synthesize(text: str, item, lang: str, out_wav: Path) -> None:
     sf.write(str(out_wav), np.concatenate(pieces[:-1]), sr)
 
 
+# ---------- картинки ----------
+class ImageBackend:
+    """Лёгкий text-to-image на sd-turbo (или любом AutoPipelineForText2Image)."""
+    name = "sd-turbo"
+
+    def __init__(self, model_id: str = IMAGE_MODEL_ID):
+        self.model_id = model_id
+        self.pipe = None
+        self.device = "cpu"
+
+    def load(self) -> None:
+        from diffusers import AutoPipelineForText2Image
+        cuda = torch.cuda.is_available()
+        self.device = "cuda" if cuda else "cpu"
+        dtype = torch.float16 if cuda else torch.float32
+        log.info("Loading image model %s on %s (%s)...", self.model_id, self.device, dtype)
+        kwargs = {"torch_dtype": dtype}
+        if cuda:
+            kwargs["variant"] = "fp16"
+        try:
+            self.pipe = AutoPipelineForText2Image.from_pretrained(self.model_id, **kwargs).to(self.device)
+        except Exception:
+            kwargs.pop("variant", None)
+            self.pipe = AutoPipelineForText2Image.from_pretrained(self.model_id, **kwargs).to(self.device)
+        log.info("Image model ready.")
+
+    def unload(self) -> None:
+        self.pipe = None
+        free_memory()
+
+    def generate(self, prompt: str, seed: int | None = None,
+                 steps: int = IMAGE_STEPS, size: int = IMAGE_SIZE) -> Image.Image:
+        if seed is None:
+            seed = int(time.time_ns() % (2**31))
+        g = torch.Generator(device=self.device).manual_seed(seed)
+        out = self.pipe(
+            prompt=prompt,
+            num_inference_steps=steps,
+            guidance_scale=0.0,
+            generator=g,
+            height=size, width=size,
+        )
+        return out.images[0]
+
+
+def get_image_backend() -> ImageBackend:
+    global IMG
+    if IMG is None:
+        IMG = ImageBackend()
+        IMG.load()
+    return IMG
+
+
+def generate_image_file(prompt: str, out_path: Path) -> None:
+    backend = get_image_backend()
+    img = backend.generate(prompt)
+    img.save(out_path)
+
+
+def generate_gif_file(prompt: str, out_path: Path) -> None:
+    """5-секундный GIF. Ключевые кадры через «|», иначе 4 сида + кроссфейд."""
+    backend = get_image_backend()
+    base_seed = int(time.time_ns() % (2**31))
+
+    if "|" in prompt:
+        keys = [p.strip() for p in prompt.split("|") if p.strip()]
+        if not keys:
+            raise ValueError("пустые ключевые кадры")
+        key_imgs = [backend.generate(k, seed=base_seed + i * 1000) for i, k in enumerate(keys)]
+    else:
+        n = min(GIF_KEYS, GIF_FRAMES)
+        key_imgs = [backend.generate(prompt, seed=base_seed + i * 1000) for i in range(n)]
+
+    n_keys = len(key_imgs)
+    frames: list[Image.Image] = []
+    for i in range(GIF_FRAMES):
+        if n_keys == 1:
+            frames.append(key_imgs[0])
+            continue
+        t = i / max(1, GIF_FRAMES - 1) * (n_keys - 1)
+        lo = int(t)
+        hi = min(lo + 1, n_keys - 1)
+        frac = t - lo
+        if frac < 1e-6 or lo == hi:
+            frames.append(key_imgs[lo])
+        else:
+            frames.append(Image.blend(key_imgs[lo], key_imgs[hi], frac))
+
+    duration = max(20, int(GIF_SECONDS * 1000 / GIF_FRAMES))
+    frames[0].save(out_path, save_all=True, append_images=frames[1:],
+                   duration=duration, loop=0, optimize=True)
+
+
 # ---------- команды и кнопки ----------
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not allowed(update):
         return
     await update.message.reply_text(
-        f"Привет! Я клонирую голос. Модель: {B.name}.\n\n"
+        f"Привет! Я клонирую голос и рисую картинки/GIF. TTS-модель: {B.name}.\n\n"
         "⚡ Быстрый способ: пришли голосовое или аудио (5-15 сек, чистая речь) - потом текст, "
         "и я озвучу его этим голосом.\n"
         "🎙 Свой голос: нажми «Создать свой голос», запиши минимум 1 минуту речи - "
-        "я сделаю личный голосовой профиль, доступный только тебе. Так качество выше.\n"
+        "я сделаю личный голосовой профиль, доступный только тебе.\n"
+        "🖼 Картинка: нажми «🖼 Картинка» и опиши, что нарисовать.\n"
+        "🎞 Гифка (5 сек): нажми «🎞 Гифка» и опиши сцену. Для связной анимации задай "
+        "ключевые кадры через «|»: «кот сидит|кот прыгает|кот приземлился».\n"
         "/lang ru - язык озвучки (ru, en, zh-cn, ja, ko, de, fr, pt, es, it)\n"
-        "/model - какая модель сейчас работает\n\n"
-        "Озвучка идёт на процессоре и может занять от секунд до нескольких минут.\n\n"
+        "/model - какая TTS-модель сейчас работает\n\n"
+        "Озвучка идёт на процессоре и может занять от секунд до нескольких минут; "
+        "картинки на CPU - 10-40 сек, GIF - до пары минут.\n\n"
         "Используй только голоса, на клонирование которых есть согласие их владельцев. "
         "Запрещено выдавать сгенерированную речь за реального человека, "
         "обманывать и мошенничать.\n\n"
-        "Чтобы продолжить, отправь /agree - это подтверждение, что ты согласен с этими правилами.",
+        "Чтобы продолжить, отправь /agree.",
         reply_markup=keyboard(ctx.user_data.get("creating", False)))
 
 
@@ -389,7 +512,7 @@ async def agree(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     ctx.user_data["agreed"] = True
     await update.message.reply_text(
-        "Принято. Пришли образец голоса или нажми «Создать свой голос».",
+        "Принято. Пришли образец голоса, нажми «Создать свой голос» или выбери картинку/GIF.",
         reply_markup=keyboard())
 
 
@@ -407,10 +530,12 @@ async def set_lang(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def cmd_model(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not allowed(update):
         return
-    lines = [f"Сейчас работает: {B.name}", ""] + [f"{k} - {v[0]}" for k, v in MODELS.items()]
+    lines = [f"Сейчас работает TTS: {B.name}", ""] + [f"{k} - {v[0]}" for k, v in MODELS.items()]
+    lines += ["", f"Картинки: {IMAGE_MODEL_ID} ({IMAGE_SIZE}x{IMAGE_SIZE}, {IMAGE_STEPS} шагов)",
+              f"GIF: {GIF_SECONDS} сек, {GIF_FRAMES} кадров (ключей при одном промпте: {GIF_KEYS})"]
     if not ctx.args:
         if ADMIN_ID and update.effective_user.id == ADMIN_ID:
-            lines += ["", "Сменить: /model xtts"]
+            lines += ["", "Сменить TTS: /model xtts"]
         await update.message.reply_text("\n".join(lines))
         return
     if not ADMIN_ID or update.effective_user.id != ADMIN_ID:
@@ -437,6 +562,7 @@ async def begin_create(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     shutil.rmtree(PENDING / str(uid), ignore_errors=True)
     ctx.user_data["creating"] = True
+    ctx.user_data.pop("gen_mode", None)
     await update.message.reply_text(
         "Запиши голосовое (или пришли аудио) со своей речью - минимум 1 минута суммарно. "
         "Можно несколькими сообщениями. Говори чётко, без музыки и фона, лучше читать вслух любой текст.\n"
@@ -447,12 +573,14 @@ async def begin_create(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def cancel_create(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     shutil.rmtree(PENDING / str(update.effective_user.id), ignore_errors=True)
     ctx.user_data["creating"] = False
+    ctx.user_data.pop("gen_mode", None)
     await update.message.reply_text("Создание голоса отменено.", reply_markup=keyboard())
 
 
 async def use_mine(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if has_profile(update.effective_user.id):
         ctx.user_data["mode"] = "profile"
+        ctx.user_data.pop("gen_mode", None)
         await update.message.reply_text("Озвучиваю твоим личным голосом. Пришли текст.")
     else:
         await update.message.reply_text("Своего голоса ещё нет - нажми «Создать свой голос».")
@@ -460,14 +588,123 @@ async def use_mine(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def delete_mine(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
-    for p in VOICES.glob(f"{uid}.*.safetensors"):   # профили всех моделей
+    for p in VOICES.glob(f"{uid}.*.safetensors"):
         p.unlink(missing_ok=True)
     PROFILES.pop(uid, None)
     QUICK.pop(uid, None)
     shutil.rmtree(PENDING / str(uid), ignore_errors=True)
     ctx.user_data.pop("mode", None)
+    ctx.user_data.pop("gen_mode", None)
     ctx.user_data["creating"] = False
     await update.message.reply_text("Твой голос и образцы удалены.", reply_markup=keyboard())
+
+
+# ---------- картинки: старт/генерация ----------
+async def start_image(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not allowed(update) or await need_agree(update, ctx):
+        return
+    if ctx.user_data.get("creating"):
+        await update.message.reply_text("Сначала заверши или отмени создание голоса (/cancel).")
+        return
+    ctx.user_data["gen_mode"] = "image"
+    await update.message.reply_text(
+        "Опиши картинку. Например: «рыжий кот на подоконнике, утренний свет, кинематографично».\n"
+        "Пришли текст - сгенерирую изображение.")
+
+
+async def start_gif(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not allowed(update) or await need_agree(update, ctx):
+        return
+    if ctx.user_data.get("creating"):
+        await update.message.reply_text("Сначала заверши или отмени создание голоса (/cancel).")
+        return
+    ctx.user_data["gen_mode"] = "gif"
+    await update.message.reply_text(
+        "Опиши GIF длиной 5 секунд. Для связной анимации задай ключевые кадры через «|»:\n"
+        "«кот сидит|кот прыгает|кот приземлился»\n"
+        "Без «|» сделаю кроссфейд из 4 разных вариантов промпта.\n"
+        "Пришли текст - сгенерирую GIF.")
+
+
+def _check_prompt(prompt: str) -> str:
+    prompt = prompt.strip()
+    if not prompt:
+        raise ValueError("empty")
+    if len(prompt) > PROMPT_MAX:
+        raise ValueError("long")
+    return prompt
+
+
+async def do_image(update: Update, ctx: ContextTypes.DEFAULT_TYPE, prompt: str):
+    if not allowed(update) or await need_agree(update, ctx):
+        return
+    try:
+        prompt = _check_prompt(prompt)
+    except ValueError as e:
+        if str(e) == "long":
+            await update.message.reply_text(f"Слишком длинный запрос (макс {PROMPT_MAX}).")
+        else:
+            await update.message.reply_text("Пустой запрос.")
+        return
+    await update.message.reply_text("Генерирую картинку...")
+    async with tts_lock:
+        try:
+            await ctx.bot.send_chat_action(update.message.chat_id, ChatAction.UPLOAD_PHOTO)
+        except Exception:
+            pass
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp) / "img.png"
+            try:
+                await asyncio.to_thread(generate_image_file, prompt, out)
+            except Exception:
+                log.exception("image gen failed")
+                await update.message.reply_text(
+                    "Не удалось сгенерировать картинку. Проверь, что установлены diffusers и Pillow.")
+                return
+            with out.open("rb") as fh:
+                await update.message.reply_photo(fh, caption=prompt[:900])
+
+
+async def do_gif(update: Update, ctx: ContextTypes.DEFAULT_TYPE, prompt: str):
+    if not allowed(update) or await need_agree(update, ctx):
+        return
+    try:
+        prompt = _check_prompt(prompt)
+    except ValueError as e:
+        if str(e) == "long":
+            await update.message.reply_text(f"Слишком длинный запрос (макс {PROMPT_MAX}).")
+        else:
+            await update.message.reply_text("Пустой запрос.")
+        return
+    await update.message.reply_text(f"Генерирую GIF ({GIF_SECONDS} сек), это может занять пару минут...")
+    async with tts_lock:
+        try:
+            await ctx.bot.send_chat_action(update.message.chat_id, ChatAction.UPLOAD_DOCUMENT)
+        except Exception:
+            pass
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp) / "anim.gif"
+            try:
+                await asyncio.to_thread(generate_gif_file, prompt, out)
+            except Exception:
+                log.exception("gif gen failed")
+                await update.message.reply_text(
+                    "Не удалось сгенерировать GIF. Проверь diffusers/Pillow и попробуй короче.")
+                return
+            with out.open("rb") as fh:
+                await update.message.reply_animation(fh, caption=prompt[:900])
+
+
+async def cmd_image(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not ctx.args:
+        return await start_image(update, ctx)
+    return await do_image(update, ctx, " ".join(ctx.args))
+
+
+async def cmd_gif(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not ctx.args:
+        return await start_gif(update, ctx)
+    return await do_gif(update, ctx, " ".join(ctx.args))
 
 
 # ---------- приём аудио ----------
@@ -480,6 +717,8 @@ async def on_audio(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     uid = update.effective_user.id
     creating = ctx.user_data.get("creating", False)
+    # аудио перебивает режим картинок/GIF
+    ctx.user_data.pop("gen_mode", None)
     with tempfile.TemporaryDirectory() as tmp:
         src = Path(tmp) / "in"
         try:
@@ -556,7 +795,6 @@ async def continue_create(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def on_profile_file(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Восстановление голоса из резервной копии .qvoice."""
     if not allowed(update) or await need_agree(update, ctx):
         return
     msg = update.message
@@ -581,16 +819,19 @@ async def on_profile_file(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         shutil.copy(src, profile_path(uid))
     PROFILES.pop(uid, None)
     ctx.user_data["mode"] = "profile"
+    ctx.user_data.pop("gen_mode", None)
     await msg.reply_text("Голос восстановлен. Пришли текст.")
 
 
-# ---------- озвучка ----------
+# ---------- озвучка / картинки по тексту ----------
 async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     global waiting
     if not allowed(update):
         return
     msg = update.message
     t = msg.text.strip()
+
+    # Кнопки-навигация
     if t == B_HELP:
         return await start(update, ctx)
     if await need_agree(update, ctx):
@@ -603,17 +844,33 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return await use_mine(update, ctx)
     if t == B_DELETE:
         return await delete_mine(update, ctx)
+    if t == B_IMAGE:
+        return await start_image(update, ctx)
+    if t == B_GIF:
+        return await start_gif(update, ctx)
+
+    # Картинки/GIF по нажатой кнопке
+    gm = ctx.user_data.get("gen_mode")
+    if gm == "image":
+        ctx.user_data.pop("gen_mode", None)
+        return await do_image(update, ctx, t)
+    if gm == "gif":
+        ctx.user_data.pop("gen_mode", None)
+        return await do_gif(update, ctx, t)
+
     if ctx.user_data.get("creating"):
         await msg.reply_text("Сейчас идёт запись голоса: пришли аудио или нажми «Отмена».")
         return
 
+    # TTS
     uid = update.effective_user.id
     mode = ctx.user_data.get("mode") or ("profile" if has_profile(uid) else "quick")
     if mode == "profile" and not has_profile(uid):
         mode = "quick"
     if mode == "quick" and uid not in QUICK:
         await msg.reply_text(
-            "Сначала пришли голосовое с образцом голоса или нажми «Создать свой голос».")
+            "Сначала пришли голосовое с образцом голоса, нажми «Создать свой голос» "
+            "или выбери «🖼 Картинка»/«🎞 Гифка».")
         return
 
     lang = ctx.user_data.get("lang", "ru")
@@ -645,7 +902,7 @@ def main():
         raise SystemExit(f"Неизвестная модель {BOT_MODEL}. Доступно: {', '.join(MODELS)}")
     B = MODELS[BOT_MODEL][1]()
     B.load()
-    log.info("Model %s loaded", B.name)
+    log.info("TTS model %s loaded", B.name)
 
     app = (Application.builder().token(TOKEN).concurrent_updates(True)
            .read_timeout(60).write_timeout(120).connect_timeout(30).build())
@@ -654,6 +911,8 @@ def main():
     app.add_handler(CommandHandler("lang", set_lang))
     app.add_handler(CommandHandler("cancel", cancel_create))
     app.add_handler(CommandHandler("model", cmd_model))
+    app.add_handler(CommandHandler("image", cmd_image))
+    app.add_handler(CommandHandler("gif", cmd_gif))
     app.add_handler(MessageHandler(filters.Document.FileExtension("qvoice"), on_profile_file))
     app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO | filters.Document.AUDIO, on_audio))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
